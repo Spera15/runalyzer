@@ -302,6 +302,61 @@ def try_extract_training_effect_from_fit(path: str) -> Dict[str, Optional[float]
         pass
     return out
 
+def try_extract_thresholds_from_fit(path: str) -> Dict[str, float]:
+    """
+    Tenta di recuperare soglie da FIT (session/user_profile):
+    - threshold_heart_rate / lthr
+    - threshold_power / functional_threshold_power
+    - threshold_speed (m/s) -> pace s/km
+    """
+    out: Dict[str, float] = {}
+    try:
+        fit = FitFile(path)
+    except Exception:
+        return out
+
+    def pace_from_speed_field(val) -> Optional[float]:
+        try:
+            v = float(val)
+            if v > 0:
+                return 1000.0 / v
+        except Exception:
+            pass
+        return None
+
+    try:
+        for msg in fit.get_messages("session"):
+            for f in msg:
+                if f.name in ("threshold_heart_rate", "lthr", "anaerobic_threshold_heart_rate"):
+                    try:
+                        out["hr_thr_bpm"] = float(f.value)
+                    except Exception:
+                        pass
+                elif f.name in ("threshold_power", "functional_threshold_power"):
+                    try:
+                        out["pwr_thr_w"] = float(f.value)
+                    except Exception:
+                        pass
+                elif f.name == "threshold_speed":
+                    p = pace_from_speed_field(f.value)
+                    if p:
+                        out["pace_thr_s_per_km"] = p
+    except Exception:
+        pass
+
+    try:
+        for msg in fit.get_messages("user_profile"):
+            for f in msg:
+                if f.name == "lactate_threshold_heart_rate" and "hr_thr_bpm" not in out:
+                    try:
+                        out["hr_thr_bpm"] = float(f.value)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return out
+
 
 # ----------------------------
 # Distance/speed + resample
@@ -771,10 +826,11 @@ def summarize(df_1s: pd.DataFrame, thresholds: Dict[str, float]) -> Dict[str, An
     out["cad_avg_spm"] = float(df_1s["cad_spm"].mean()) if df_1s["cad_spm"].notna().any() else np.nan
 
     if df_1s["alt_m"].notna().any():
-        alt = df_1s["alt_m"].to_numpy(dtype=float)
-        dalt = np.diff(alt)
-        gain = float(np.sum(dalt[dalt > 0]))
-        loss = float(-np.sum(dalt[dalt < 0]))
+        alt_series = pd.Series(df_1s["alt_m"], dtype=float).rolling(window=5, center=True, min_periods=1).median()
+        dalt = np.diff(alt_series)
+        dalt[np.abs(dalt) < 1.0] = 0.0  # filtra rumore <1m
+        gain = float(np.nansum(dalt[dalt > 0]))
+        loss = float(-np.nansum(dalt[dalt < 0]))
         out["elev_gain_m"] = gain
         out["elev_loss_m"] = loss
     else:
@@ -1103,8 +1159,8 @@ def plot_hr_vs_pace_buckets(df_1s: pd.DataFrame, out_png: str) -> None:
         return
 
     pace_min = df["pace_s_per_km"] / 60.0
-    # bucket ogni 30s da 3:00 a 7:30
-    edges = np.arange(3.0, 7.51, 0.5)
+    # bucket ogni 15s da 3:00 a 7:30
+    edges = np.arange(3.0, 7.51, 0.25)
     labels = []
     for i in range(len(edges) - 1):
         a = edges[i]
@@ -1115,13 +1171,21 @@ def plot_hr_vs_pace_buckets(df_1s: pd.DataFrame, out_png: str) -> None:
     grp = df.groupby("bucket")["hr_bpm"].mean().reset_index()
     grp = grp.dropna(subset=["bucket", "hr_bpm"])
 
+    # Ordina da lento (sinistra) a veloce (destra)
+    order = list(reversed(labels))
+    grp["bucket"] = pd.Categorical(grp["bucket"], categories=order, ordered=True)
+    grp = grp.sort_values("bucket")
+
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.bar(grp["bucket"], grp["hr_bpm"], color="#0ea5e9")
+    ax.plot(grp["bucket"], grp["hr_bpm"], color="#0ea5e9", marker="o", linewidth=1.6, markersize=4)
+    y_min = float(np.nanmin(df["hr_bpm"])) if df["hr_bpm"].notna().any() else 0.0
+    y_max = float(np.nanmax(df["hr_bpm"])) if df["hr_bpm"].notna().any() else 0.0
+    ax.set_ylim(bottom=y_min - 2 if y_min else 0, top=y_max + 2 if y_max else None)
     ax.set_ylabel("FC media (bpm)")
-    ax.set_xlabel("Passo (bucket 30s)")
+    ax.set_xlabel("Passo (bucket 15s) · sinistra lento → destra veloce")
     ax.set_title("FC vs passo (solo ritmo ≤ 7:30/km)")
     ax.grid(True, axis="y", linewidth=0.8, color="#e5e7eb")
-    plt.xticks(rotation=45, ha="right")
+    plt.xticks(rotation=60, ha="right")
     plt.tight_layout()
     plt.savefig(out_png, dpi=150)
     plt.close()
@@ -1456,13 +1520,13 @@ def write_report_html(
         vmin=2.0, vmax=6.0,
         ticks=["2.0", "4.0", "6.0"],
         bands=[
-            (2.0, 2.8, "bg-violet-600"),
-            (2.8, 3.4, "bg-blue-600"),
+            (2.0, 2.8, "bg-red-600"),
+            (2.8, 3.4, "bg-amber-500"),
             (3.4, 4.2, "bg-green-500"),
-            (4.2, 5.0, "bg-amber-500"),
-            (5.0, 6.0, "bg-red-600"),
+            (4.2, 5.0, "bg-blue-600"),
+            (5.0, 6.0, "bg-violet-600"),
         ],
-        note="Valore medio quando stai correndo (speed>1.5 m/s). Utile per confronti interni."
+        note="Più alto = meglio (speed>1.5 m/s). Utile per confronti interni e confronti tra allenamenti."
     ))
 
     nerd_html = f"""
@@ -1707,6 +1771,10 @@ def main():
         raise SystemExit(f"--cat must be one of: {sorted(CAT_ALLOWED)}")
 
     # Parse thresholds
+    hr_thr_default = ap.get_default("hr_thr")
+    pwr_thr_default = ap.get_default("pwr_thr")
+    pace_thr_default = ap.get_default("pace_thr")
+
     mm, ss = args.pace_thr.split(":")
     thresholds: Dict[str, float] = {
         "hr_thr_bpm": float(args.hr_thr),
@@ -1721,6 +1789,16 @@ def main():
         w = try_extract_weight_from_fit(fit_path)
         if w is not None:
             thresholds["weight_kg"] = float(w)
+
+    # Override thresholds from FIT if user kept defaults and FIT provides them
+    if has_fit:
+        fit_thr = try_extract_thresholds_from_fit(str(fit_path))
+        if args.hr_thr == hr_thr_default and "hr_thr_bpm" in fit_thr:
+            thresholds["hr_thr_bpm"] = float(fit_thr["hr_thr_bpm"])
+        if args.pwr_thr == pwr_thr_default and "pwr_thr_w" in fit_thr:
+            thresholds["pwr_thr_w"] = float(fit_thr["pwr_thr_w"])
+        if args.pace_thr == pace_thr_default and "pace_thr_s_per_km" in fit_thr:
+            thresholds["pace_thr_s_per_km"] = float(fit_thr["pace_thr_s_per_km"])
 
     # Read data
     df_fit = parse_fit_records(str(fit_path)) if fit_path else pd.DataFrame()
