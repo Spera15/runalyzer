@@ -1160,7 +1160,7 @@ def plot_hr_vs_pace_buckets(df_1s: pd.DataFrame, out_png: str) -> None:
 
     pace_min = df["pace_s_per_km"] / 60.0
     # bucket ogni 15s da 3:00 a 7:30
-    edges = np.arange(3.0, 7.51, 0.25)
+    edges = np.arange(3.0, 7.51, (1/6))
     labels = []
     for i in range(len(edges) - 1):
         a = edges[i]
@@ -1182,7 +1182,7 @@ def plot_hr_vs_pace_buckets(df_1s: pd.DataFrame, out_png: str) -> None:
     y_max = float(np.nanmax(df["hr_bpm"])) if df["hr_bpm"].notna().any() else 0.0
     ax.set_ylim(bottom=y_min - 2 if y_min else 0, top=y_max + 2 if y_max else None)
     ax.set_ylabel("FC media (bpm)")
-    ax.set_xlabel("Passo (bucket 15s) · sinistra lento → destra veloce")
+    ax.set_xlabel("Passo (bucket 10s)")
     ax.set_title("FC vs passo (solo ritmo ≤ 7:30/km)")
     ax.grid(True, axis="y", linewidth=0.8, color="#e5e7eb")
     plt.xticks(rotation=60, ha="right")
