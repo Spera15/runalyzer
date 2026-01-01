@@ -781,32 +781,51 @@ def summarize(df_1s: pd.DataFrame, thresholds: Dict[str, float]) -> Dict[str, An
         out["elev_gain_m"] = np.nan
         out["elev_loss_m"] = np.nan
 
-    # Drift proxy (middle 60% steady-ish)
+    # Drift proxy (pace-adjusted to avoid bias when pace varies). Excludes pace slower than 7:30/km.
     drift = {}
     if df_1s["hr_bpm"].notna().any() and df_1s["pace_s_per_km"].notna().any():
-        n = len(df_1s)
-        a = int(n * 0.2)
-        b = int(n * 0.8)
-        sub = df_1s.iloc[a:b].copy()
-        median_pace = float(sub["pace_s_per_km"].median())
-        mask = sub["pace_s_per_km"].between(median_pace * 0.9, median_pace * 1.1)
-        steady = sub.loc[mask].copy()
-        if len(steady) > 120:
-            mid_t = steady["timestamp"].iloc[0] + (steady["timestamp"].iloc[-1] - steady["timestamp"].iloc[0]) / 2
-            first = steady[steady["timestamp"] <= mid_t]
-            second = steady[steady["timestamp"] > mid_t]
-            hr1 = float(first["hr_bpm"].mean())
-            hr2 = float(second["hr_bpm"].mean())
-            drift = {
-                "steady_hr_first_bpm": hr1,
-                "steady_hr_second_bpm": hr2,
-                "hr_drift_bpm": hr2 - hr1,
-                "hr_drift_pct": (hr2 - hr1) / hr1 * 100.0 if hr1 else np.nan
-            }
+        filtered = df_1s[
+            df_1s["pace_s_per_km"].notna()
+            & df_1s["hr_bpm"].notna()
+            & (df_1s["pace_s_per_km"] <= 450)  # <= 7:30 min/km
+        ].copy()
+        if len(filtered) > 180:
+            try:
+                slope, intercept = np.polyfit(filtered["pace_s_per_km"], filtered["hr_bpm"], 1)
+                filtered["hr_pred"] = slope * filtered["pace_s_per_km"] + intercept
+            except Exception:
+                slope, intercept = np.nan, np.nan
+                filtered["hr_pred"] = np.nan
+            filtered = filtered.dropna(subset=["hr_pred"])
+            if len(filtered) > 120:
+                filtered["hr_residual"] = filtered["hr_bpm"] - filtered["hr_pred"]
+                mid_t = filtered["timestamp"].iloc[0] + (filtered["timestamp"].iloc[-1] - filtered["timestamp"].iloc[0]) / 2
+                first = filtered[filtered["timestamp"] <= mid_t]
+                second = filtered[filtered["timestamp"] > mid_t]
+                if len(first) > 30 and len(second) > 30:
+                    res1 = float(first["hr_residual"].mean())
+                    res2 = float(second["hr_residual"].mean())
+                    ref_hr = float(np.nanmedian(filtered["hr_pred"]))
+                    drift = {
+                        "pace_adj_hr_residual_first_bpm": res1,
+                        "pace_adj_hr_residual_second_bpm": res2,
+                        "hr_drift_bpm": res2 - res1,
+                        "hr_drift_pct": (res2 - res1) / ref_hr * 100.0 if ref_hr else np.nan,
+                        "ref_hr_bpm": ref_hr,
+                        "pace_model_slope": float(slope) if not np.isnan(slope) else np.nan,
+                        "pace_model_intercept": float(intercept) if not np.isnan(intercept) else np.nan,
+                        "median_pace_s_per_km": float(np.nanmedian(filtered["pace_s_per_km"])),
+                        "samples_used": len(filtered),
+                        "note": "Calcolato su residui HR vs passo (filtra >7:30/km)."
+                    }
+                else:
+                    drift = {"note": "Non abbastanza dati dopo filtro ritmo>7:30/km per stimare drift."}
+            else:
+                drift = {"note": "Non abbastanza dati validi per stimare drift dopo regressione."}
         else:
-            drift = {"note": "Not enough steady-state samples for drift."}
+            drift = {"note": "Dati ritmo/FC insufficienti dopo filtro >7:30 min/km."}
     else:
-        drift = {"note": "HR or pace missing."}
+        drift = {"note": "HR o passo mancanti."}
     out["drift"] = drift
 
     # Efficiency
@@ -1068,6 +1087,45 @@ def plot_overview(df_1s: pd.DataFrame, intervals: pd.DataFrame, out_png: str) ->
     plt.savefig(out_png, dpi=150)
     plt.close()
 
+def plot_hr_vs_pace_buckets(df_1s: pd.DataFrame, out_png: str) -> None:
+    df = df_1s.copy()
+    df = df[df["hr_bpm"].notna() & df["pace_s_per_km"].notna()]
+    # escludi camminate lente
+    df = df[df["pace_s_per_km"] <= 450]  # <= 7:30 min/km
+
+    if df.empty:
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.text(0.5, 0.5, "Dati insufficienti per FC vs passo", ha="center", va="center")
+        ax.axis("off")
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=150)
+        plt.close()
+        return
+
+    pace_min = df["pace_s_per_km"] / 60.0
+    # bucket ogni 30s da 3:00 a 7:30
+    edges = np.arange(3.0, 7.51, 0.5)
+    labels = []
+    for i in range(len(edges) - 1):
+        a = edges[i]
+        b = edges[i+1]
+        labels.append(f"{format_pace(a*60)} – {format_pace(b*60)}")
+
+    df["bucket"] = pd.cut(pace_min, bins=edges, labels=labels, include_lowest=True, right=False)
+    grp = df.groupby("bucket")["hr_bpm"].mean().reset_index()
+    grp = grp.dropna(subset=["bucket", "hr_bpm"])
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.bar(grp["bucket"], grp["hr_bpm"], color="#0ea5e9")
+    ax.set_ylabel("FC media (bpm)")
+    ax.set_xlabel("Passo (bucket 30s)")
+    ax.set_title("FC vs passo (solo ritmo ≤ 7:30/km)")
+    ax.grid(True, axis="y", linewidth=0.8, color="#e5e7eb")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
 
 def plot_zones(
     df_1s: pd.DataFrame,
@@ -1241,6 +1299,7 @@ def write_report_html(
     intervals_detail: Optional[pd.DataFrame],
     zones_png: str,
     overview_png: str,
+    hr_pace_png: str,
     hr_zones_block: str,
     pwr_zones_block: str,
     training_effect: Dict[str, Optional[float]],
@@ -1302,30 +1361,36 @@ def write_report_html(
 
         v = float(value)
         v = max(vmin, min(vmax, v))
-        pos = 0.0 if vmax <= vmin else (v - vmin) / (vmax - vmin) * 100.0
+        span = (vmax - vmin) if vmax != vmin else 1.0
+        pos = (v - vmin) / span * 100.0
 
-        # segmenti colorati
         segs = []
         for a, b, cls in bands:
-            w = 0.0 if vmax <= vmin else (b - a) / (vmax - vmin) * 100.0
-            segs.append(f"<div class='{cls}' style='width:{w:.4f}%; height:10px;'></div>")
+            a = max(vmin, a)
+            b = min(vmax, b)
+            if b <= a:
+                continue
+            left = (a - vmin) / span * 100.0
+            width = (b - a) / span * 100.0
+            segs.append(f"<div class='absolute inset-y-0 {cls}' style='left:{left:.4f}%; width:{width:.4f}%;'></div>")
 
-        tick_html = "".join([f"<div><span class='tabular-nums'>{t}</span></div>" for t in ticks])
+        ticks_html = "".join([f"<div><span class='tabular-nums'>{t}</span></div>" for t in ticks])
 
         return f"""
         <div class="p-4 rounded-lg border bg-white">
           <div class="flex items-baseline justify-between">
             <div class="font-semibold">{label}</div>
-            <div class="text-sm">{value_str}</div>
+            <div class="text-sm text-slate-800">{value_str}</div>
           </div>
 
-          <div class="mt-3 gauge flex">
+          <div class="relative mt-3 h-3 rounded-full overflow-hidden bg-slate-200">
             {''.join(segs)}
-            <div class="gauge-marker" style="left:{pos:.2f}%"></div>
+            <div class="absolute -top-0.5" style="left:{pos:.2f}%; transform:translateX(-50%);">
+              <div class="w-4 h-4 rounded-full bg-white border-2 border-slate-900 shadow"></div>
+            </div>
           </div>
 
-          <div class="gauge-ticks">{tick_html}</div>
-
+          <div class="flex justify-between text-[11px] text-slate-500 mt-1">{ticks_html}</div>
           <div class="text-xs text-slate-500 mt-2">{note}</div>
         </div>
         """
@@ -1542,6 +1607,7 @@ def write_report_html(
         .replace("{{RPE}}", str(meta.get("rpe","n/a")) if meta.get("rpe","") != "" else "n/a")
         .replace("{{SUBTITLE}}", subtitle)
         .replace("{{OVERVIEW_PNG}}", overview_png)
+        .replace("{{HR_PACE_PNG}}", hr_pace_png)
         .replace("{{ZONES_PNG}}", zones_png)
         .replace("{{SUMMARY_LIST}}", summary_html)
         .replace("{{THRESHOLDS_LIST}}", thresholds_html)
@@ -1600,8 +1666,8 @@ def main():
 
     # output directory root
     ap.add_argument("--outdir", type=str, default="out_analysis")
-	
-	# category
+    
+    # category
     ap.add_argument("--cat", type=str, default=None)
 
     # soglie / opzioni
@@ -1732,6 +1798,7 @@ def main():
     # Plot overview + zones nella cartella attività
     overview_png_name = os.path.basename(out_path(activity_outdir, prefix, "overview", "png"))
     zones_png_name = os.path.basename(out_path(activity_outdir, prefix, "zones", "png"))
+    hr_pace_png_name = os.path.basename(out_path(activity_outdir, prefix, "hr_pace", "png"))
 
     if not args.no_plots:
         plot_overview(
@@ -1745,6 +1812,10 @@ def main():
             df_1s,
             thresholds,
             out_path(activity_outdir, prefix, "zones", "png"),
+        )
+        plot_hr_vs_pace_buckets(
+            df_1s,
+            out_path(activity_outdir, prefix, "hr_pace", "png"),
         )
 
     # Report ripetute
@@ -1830,6 +1901,7 @@ def main():
         intervals_detail=intervals_detail,
         zones_png=zones_png_name,
         overview_png=overview_png_name,
+        hr_pace_png=hr_pace_png_name,
         hr_zones_block=hr_zones_block,
         pwr_zones_block=pwr_zones_block,
         training_effect=training_effect
