@@ -218,6 +218,16 @@ def parse_fit_records(path: str) -> pd.DataFrame:
     keep = ["timestamp","lat","lon","alt_m","hr_bpm","cad_spm","power_w","speed_mps","temp_c"]
     return df[keep].sort_values("timestamp").reset_index(drop=True)
 
+def load_zones_config(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
 def parse_fit_laps(path: str) -> pd.DataFrame:
     fit = FitFile(path)
     laps = []
@@ -699,7 +709,8 @@ def compute_interval_details(
         "Wkg_med": float(np.nanmean(out["Wkg_med"])) if out["Wkg_med"].notna().any() else np.nan,
     }
 
-    out = pd.concat([out, pd.DataFrame([tot])], ignore_index=True)
+    out = out.dropna(axis=1, how="all")
+    out = pd.concat([out, pd.DataFrame([tot])], ignore_index=True, sort=False)
     return out
 
 # ----------------------------
@@ -1159,7 +1170,7 @@ def plot_hr_vs_pace_buckets(df_1s: pd.DataFrame, out_png: str) -> None:
         return
 
     pace_min = df["pace_s_per_km"] / 60.0
-    # bucket ogni 15s da 3:00 a 7:30
+    # bucket ogni 10s da 3:00 a 7:30
     edges = np.arange(3.0, 7.51, (1/6))
     labels = []
     for i in range(len(edges) - 1):
@@ -1261,18 +1272,46 @@ ZONE_COLORS = {
 }
 
 def compute_hr_zones(df_1s: pd.DataFrame, hr_thr: Optional[float]) -> List[Dict[str, Any]]:
-    if hr_thr is None or not df_1s["hr_bpm"].notna().any():
-        return []
-    thr = float(hr_thr)
+    return compute_hr_zones_custom(df_1s, hr_thr, None, None)
 
-    # euristico su soglia HR
-    edges = [
-        (0.00*thr, 0.80*thr, 1, "Riscaldamento"),
-        (0.80*thr, 0.90*thr, 2, "Facile"),
-        (0.90*thr, 1.00*thr, 3, "Aerobico"),
-        (1.00*thr, 1.05*thr, 4, "Soglia"),
-        (1.05*thr, 10.0*thr, 5, "Massima"),
-    ]
+def _zones_from_edges(edges: List[float], names: Optional[List[str]], is_power: bool) -> List[Tuple[float, float, int, str]]:
+    # edges: ascending list. Last edge is high bound; if missing hi, extend.
+    bounds = list(edges)
+    if len(bounds) < 2:
+        return []
+    out = []
+    for i in range(len(bounds) - 1):
+        lo = bounds[i]
+        hi = bounds[i+1]
+        name = names[i] if names and i < len(names) else ("Zona" if is_power else "Zona")
+        out.append((lo, hi, i+1, name))
+    # last open-ended
+    out[-1] = (out[-1][0], float("inf"), out[-1][2], names[len(out)-1] if names and len(names) >= len(out) else out[-1][3])
+    return out
+
+def compute_hr_zones_custom(
+    df_1s: pd.DataFrame,
+    hr_thr: Optional[float],
+    hr_edges: Optional[List[float]],
+    hr_names: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    if not df_1s["hr_bpm"].notna().any():
+        return []
+
+    edges = []
+    if hr_edges:
+        edges = _zones_from_edges(hr_edges, hr_names, is_power=False)
+    elif hr_thr is not None:
+        thr = float(hr_thr)
+        edges = [
+            (0.00*thr, 0.80*thr, 1, "Riscaldamento"),
+            (0.80*thr, 0.90*thr, 2, "Facile"),
+            (0.90*thr, 1.00*thr, 3, "Aerobico"),
+            (1.00*thr, 1.05*thr, 4, "Soglia"),
+            (1.05*thr, 10.0*thr, 5, "Massima"),
+        ]
+    else:
+        return []
 
     total_s = float(df_1s["dt_s"].sum()) if "dt_s" in df_1s.columns else float(len(df_1s))
     hr = df_1s["hr_bpm"].to_numpy(dtype=float)
@@ -1283,30 +1322,46 @@ def compute_hr_zones(df_1s: pd.DataFrame, hr_thr: Optional[float]) -> List[Dict[
         mask = (hr >= lo) & (hr < hi)
         sec = float(np.nansum(dt[mask]))
         pct = (sec / total_s * 100.0) if total_s > 0 else 0.0
+        rng = f"{int(round(lo))}–{int(round(hi))} bpm" if np.isfinite(hi) else f">{int(round(lo))} bpm"
+        color = ZONE_COLORS.get(z, ZONE_COLORS.get(5, "bg-slate-400"))
         rows.append({
             "z": z,
             "label": f"Zona {z}",
             "name": name,
-            "range": f"{int(round(lo))}–{int(round(hi))} bpm" if z < 5 else f">{int(round(lo))} bpm",
+            "range": rng,
             "sec": sec,
             "pct": pct,
-            "color": ZONE_COLORS[z],
+            "color": color,
         })
     # Garmin: Z5 in alto
     return list(reversed(rows))
 
 def compute_power_zones(df_1s: pd.DataFrame, pwr_thr: Optional[float]) -> List[Dict[str, Any]]:
-    if pwr_thr is None or not df_1s["power_w"].notna().any():
-        return []
-    thr = float(pwr_thr)
+    return compute_power_zones_custom(df_1s, pwr_thr, None, None)
 
-    edges = [
-        (0.00*thr, 0.80*thr, 1, "Facile"),
-        (0.80*thr, 0.90*thr, 2, "Moderato"),
-        (0.90*thr, 1.00*thr, 3, "Tempo"),
-        (1.00*thr, 1.15*thr, 4, "Intervallo lungo"),
-        (1.15*thr, 10.0*thr, 5, "Intervallo breve"),
-    ]
+def compute_power_zones_custom(
+    df_1s: pd.DataFrame,
+    pwr_thr: Optional[float],
+    pwr_edges: Optional[List[float]],
+    pwr_names: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    if not df_1s["power_w"].notna().any():
+        return []
+
+    edges = []
+    if pwr_edges:
+        edges = _zones_from_edges(pwr_edges, pwr_names, is_power=True)
+    elif pwr_thr is not None:
+        thr = float(pwr_thr)
+        edges = [
+            (0.00*thr, 0.80*thr, 1, "Facile"),
+            (0.80*thr, 0.90*thr, 2, "Moderato"),
+            (0.90*thr, 1.00*thr, 3, "Tempo"),
+            (1.00*thr, 1.15*thr, 4, "Intervallo lungo"),
+            (1.15*thr, 10.0*thr, 5, "Intervallo breve"),
+        ]
+    else:
+        return []
 
     total_s = float(df_1s["dt_s"].sum()) if "dt_s" in df_1s.columns else float(len(df_1s))
     pw = df_1s["power_w"].to_numpy(dtype=float)
@@ -1317,14 +1372,16 @@ def compute_power_zones(df_1s: pd.DataFrame, pwr_thr: Optional[float]) -> List[D
         mask = (pw >= lo) & (pw < hi)
         sec = float(np.nansum(dt[mask]))
         pct = (sec / total_s * 100.0) if total_s > 0 else 0.0
+        rng = f"{int(round(lo))}–{int(round(hi))} W" if np.isfinite(hi) else f">{int(round(lo))} W"
+        color = ZONE_COLORS.get(z, ZONE_COLORS.get(5, "bg-slate-400"))
         rows.append({
             "z": z,
             "label": f"Zona {z}",
             "name": name,
-            "range": f"{int(round(lo))}–{int(round(hi))} W" if z < 5 else f">{int(round(lo))} W",
+            "range": rng,
             "sec": sec,
             "pct": pct,
-            "color": ZONE_COLORS[z],
+            "color": color,
         })
     return list(reversed(rows))
 
@@ -1741,6 +1798,7 @@ def main():
     ap.add_argument("--weight", type=float, default=None)
     ap.add_argument("--rpe", type=float, default=None)
     ap.add_argument("--no_plots", action="store_true")
+    ap.add_argument("--zones_cfg", type=str, default=None, help="JSON con zone personalizzate (hr_bpm_edges, pwr_w_edges)")
 
     args = ap.parse_args()
 
@@ -1842,8 +1900,14 @@ def main():
     summary = summarize(df_1s, thresholds)
     intervals_used = pd.DataFrame()
 	
-    hr_z = compute_hr_zones(df_1s, thresholds.get("hr_thr_bpm"))
-    pw_z = compute_power_zones(df_1s, thresholds.get("pwr_thr_w"))
+    zones_cfg = load_zones_config(args.zones_cfg)
+    hr_edges_cfg = zones_cfg.get("hr_bpm_edges")
+    hr_names_cfg = zones_cfg.get("hr_labels")
+    pwr_edges_cfg = zones_cfg.get("pwr_w_edges")
+    pwr_names_cfg = zones_cfg.get("pwr_labels")
+
+    hr_z = compute_hr_zones_custom(df_1s, thresholds.get("hr_thr_bpm"), hr_edges_cfg, hr_names_cfg)
+    pw_z = compute_power_zones_custom(df_1s, thresholds.get("pwr_thr_w"), pwr_edges_cfg, pwr_names_cfg)
     hr_zones_block = render_zones_block(hr_z)
     pwr_zones_block = render_zones_block(pw_z)
 
